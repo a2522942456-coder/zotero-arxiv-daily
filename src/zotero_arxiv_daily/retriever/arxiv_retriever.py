@@ -4,7 +4,7 @@ from arxiv import Result as ArxivResult
 from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 import calendar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import os
 from queue import Empty
@@ -215,6 +215,72 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
+        # Zero keeps the original daily RSS mode for existing configurations.
+        days = self.config.source.arxiv.get("lookback_days", 0)
+        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+            raise ValueError("source.arxiv.lookback_days must be a non-negative integer.")
+        if days:
+            return self._retrieve_recent_papers(days)
+        return self._retrieve_rss_papers()
+
+    def _retrieve_recent_papers(self, days: int) -> list[ArxivResult]:
+        settings = self.config.source.arxiv
+        categories = list(settings.category)
+        if not categories or any(
+            not isinstance(category, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", category)
+            for category in categories
+        ):
+            raise ValueError("source.arxiv.category must contain valid arXiv category codes.")
+        limit = settings.get("max_results", 200)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10000:
+            raise ValueError("source.arxiv.max_results must be an integer between 1 and 10000.")
+        if self.config.executor.debug:
+            limit = min(limit, 10)
+
+        end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        start = end - timedelta(days=days)
+        category_query = " OR ".join(f"cat:{category}" for category in categories)
+        query = (
+            f"({category_query}) AND "
+            f"submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
+        )
+        logger.info(
+            f"Retrieving arxiv submissions from {start.isoformat()} to {end.isoformat()} "
+            f"(UTC; lookback_days={days}, max_results={limit})"
+        )
+        search = arxiv.Search(
+            query=query,
+            max_results=limit,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
+        )
+        client = arxiv.Client(page_size=min(limit, 100), delay_seconds=3.0, num_retries=3)
+        include_cross_list = settings.get("include_cross_list", False)
+        papers = []
+        seen_ids = set()
+        fetched = 0
+        # Let API failures raise: a network error must not look like zero matches.
+        for paper in client.results(search):
+            fetched += 1
+            if not include_cross_list and paper.primary_category not in categories:
+                continue
+            paper_id = re.sub(r"v\d+$", "", paper.get_short_id())
+            if paper_id in seen_ids:
+                continue
+            seen_ids.add(paper_id)
+            papers.append(paper)
+        if fetched >= limit:
+            logger.warning(
+                f"arxiv API reached max_results={limit}; older matching papers in the "
+                "date range may be omitted. Increase source.arxiv.max_results if needed."
+            )
+        logger.info(
+            f"Retrieved {fetched} arxiv API results; retained {len(papers)} unique papers "
+            "after category filtering"
+        )
+        return papers
+
+    def _retrieve_rss_papers(self) -> list[ArxivResult]:
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         rss_url = f"https://rss.arxiv.org/atom/{query}"
